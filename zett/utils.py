@@ -28,41 +28,29 @@ CACHE_DIR = Path(__file__).parent / ".." / ".cache"
 MADLAD_METADATA = pd.read_csv(Path(__file__).parent / ".." / "data" / "madlad400_metadata.csv", index_col="lang_code")
 SPLIT_REGEX = r"'s|'t|'re|'ve|'m|'ll|'d| ?[\p{L}\p{M}]+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
 
-
 def softmax(x, axis=-1):
     x = x - x.max(axis=axis, keepdims=True)
     x = np.exp(x)
     x = x / x.sum(axis=axis)
     return x
 
-
 def cosine_similarity(x, y):
     # x, y: (batch, dim)
     x = x / np.linalg.norm(x, axis=-1, keepdims=True)
     y = y / np.linalg.norm(y, axis=-1, keepdims=True)
-
     return (x * y).sum(axis=-1)
-
 
 def huber_loss(predictions, targets=None, delta: float = 1.0):
     errors = (predictions - targets) if (targets is not None) else predictions
-    # 0.5 * err^2                  if |err| <= d
-    # 0.5 * d^2 + d * (|err| - d)  if |err| > d
     abs_errors = jnp.abs(errors)
     quadratic = jnp.minimum(abs_errors, delta)
-    # Same as max(abs_x - delta, 0) but avoids potentially doubling gradient.
     linear = abs_errors - quadratic
     return 0.5 * quadratic**2 + delta * linear
 
-
 def default_pretokenize(text):
-    # very conservative default pre-tokenization, split such that there is never whitespace at the end of a token (but allowed at the start)
-    # we need this because e.g. Llama tokenizer does not specify any pre-tokenization (in the HF version)
-
     tokens = []
     token = ""
     has_non_whitespace = False
-
     for c in text:
         if c.isspace():
             if has_non_whitespace:
@@ -71,45 +59,31 @@ def default_pretokenize(text):
                 has_non_whitespace = False
         else:
             has_non_whitespace = True
-
         token += c
-
     if len(token) > 0:
         tokens.append((token, None))
-
     return tokens
 
-
 def create_learning_rate_fn(args):
-    """Returns a linear warmup, linear_decay learning rate function."""
-
     args = copy.deepcopy(args)
-
     if not hasattr(args, "random_warmup_steps"):
         args.random_warmup_steps = 0
-
     if not getattr(args, "random_learning_rate", None):
         args.random_learning_rate = args.learning_rate
-
     if isinstance(args.warmup_steps, int):
         args.warmup_steps = [args.warmup_steps]
-
     if isinstance(args.learning_rate, float):
         args.learning_rate = [args.learning_rate] * len(args.warmup_steps)
-
     random_warmup_fn = optax.linear_schedule(
         init_value=0.0,
         end_value=args.random_learning_rate,
         transition_steps=args.random_warmup_steps,
     )
-
     warmup_fns = []
     warmup_boundaries = [args.random_warmup_steps]
-
     for i, warmup_boundary in enumerate(args.warmup_steps):
         n_steps = warmup_boundary - warmup_boundaries[-1]
         warmup_boundaries.append(warmup_boundary)
-
         warmup_fns.append(
             optax.linear_schedule(
                 init_value=0.0,
@@ -117,7 +91,6 @@ def create_learning_rate_fn(args):
                 transition_steps=n_steps,
             )
         )
-
     decay_fn = optax.cosine_decay_schedule(
         init_value=args.learning_rate[-1],
         decay_steps=args.steps - warmup_boundary,
@@ -137,14 +110,11 @@ def create_learning_rate_fn(args):
             *args.warmup_steps,
         ],
     )
-
     return random_schedule_fn, pretrained_schedule_fn
-
 
 class Rescaler(nn.Module):
     dim: int
     dtype: jnp.dtype = jnp.float32
-
     def setup(self):
         self.w = self.param(
             "w",
@@ -158,25 +128,19 @@ class Rescaler(nn.Module):
             (1, self.dim),
             self.dtype,
         )
-
     def __call__(self, x):
         return self.w * x + self.b
-
     @staticmethod
     def scale_to(x, target=None, target_stds=None, target_means=None):
         if target_stds is None:
             target_stds = target.std(axis=0)
         if target_means is None:
             target_means = target.mean(axis=0)
-
         w = (target_stds / (x.std(axis=0) + EPSILON))[None]
         b = (target_means - (x * w).mean(axis=0))[None]
-
         return w, b
 
-
 def has_same_special_tokens(source, target):
-    # check if all special tokens are the same
     return all(
         getattr(source, attr) == getattr(target, attr)
         for attr in [
@@ -190,47 +154,34 @@ def has_same_special_tokens(source, target):
         ]
     )
 
-
 def pad_to_multiple_of(x, n, constant_values=0):
     remainder = x.shape[0] % n
     if remainder == 0:
         return x
-
     pad_width = [(0, n - remainder)] + [(0, 0)] * (x.ndim - 1)
     return np.pad(x, pad_width, mode="constant", constant_values=constant_values)
-
 
 def make_whitespace_consistent(tokenizer, maxlen):
     extra_whitespace = ["Ġ", "Ċ", "ĉ"]
     consistent_tokenizer = copy.deepcopy(tokenizer)
-
     pieces = consistent_tokenizer._tokenizer.model.get_pieces()
-
     for i in range(len(pieces)):
         if sum(c in extra_whitespace for c in pieces[i][0]) > 1:
             pieces[i] = (f"<unused_whitespace__{i}>", NEGATIVE_INF_FILL_VALUE)
-
     for c1 in extra_whitespace:
         for i in range(1, maxlen):
             for c2 in extra_whitespace:
                 pieces.append((c2 + c1 * i, 0.0))
-
     consistent_tokenizer._tokenizer.model = models.Unigram(
         pieces, unk_id=tokenizer.unk_token_id
     )
-
     return consistent_tokenizer
 
-
 def copy_tokenizer_auxiliaries(source, target):
-    # add special tokens
-    # make sure these keep positions as in the original vocab
-    # because models may depend on special token positions (e.g. model.config.pad_token_id)
     if source.get_vocab() == target.get_vocab() and has_same_special_tokens(
         source, target
     ):
         return target
-
     needs_piece_update = False
     for source_token in source.all_special_tokens:
         if (
@@ -239,34 +190,26 @@ def copy_tokenizer_auxiliaries(source, target):
             != target.convert_tokens_to_ids(source_token)
         ):
             needs_piece_update = True
-
     if needs_piece_update:  # only implemented for Unigram
         pieces = target._tokenizer.model.get_pieces()
         pieces = [
             piece for piece in pieces if piece[0] not in source.all_special_tokens
         ]
-
         for i in np.argsort(source.all_special_ids):
             pieces.insert(
                 source.all_special_ids[i], (source.all_special_tokens[i], 0.0)
             )
-
         target._tokenizer.model.set_pieces(pieces)
-
     if source._tokenizer.post_processor is not None:
         target._tokenizer.post_processor = source._tokenizer.post_processor
-
-    # make sure length etc. is updated and cache is cleared
     with NamedTemporaryFile() as f:
         original_name_or_path = target.name_or_path
         target._tokenizer.save(f.name)
-
         target = PreTrainedTokenizerFast(
             tokenizer_object=Tokenizer.from_file(f.name),
             clean_up_tokenization_spaces=False,
         )
         target.name_or_path = original_name_or_path
-
     target.eos_token = source.eos_token
     target.pad_token = source.pad_token
     target.sep_token = source.sep_token
@@ -277,7 +220,6 @@ def copy_tokenizer_auxiliaries(source, target):
     target.unk_token = source.unk_token
     return target
 
-
 def unset_tokenizer_special_tokens(tokenizer):
     tokenizer.eos_token = None
     tokenizer.pad_token = None
@@ -286,7 +228,6 @@ def unset_tokenizer_special_tokens(tokenizer):
     tokenizer.bos_token = None
     tokenizer.cls_token = None
     tokenizer.mask_token = None
-
 
 def get_prior(mode, input_ids, tokenizer, padding=0):
     if mode == "keep":
@@ -308,15 +249,11 @@ def get_prior(mode, input_ids, tokenizer, padding=0):
                 constant_values=NEGATIVE_INF_FILL_VALUE,
             )
         )
-
-    # special tokens bias are 0 by convention
     if len(tokenizer.all_special_ids) > 0:
         target_priors = target_priors.at[jnp.array(tokenizer.all_special_ids)].set(0.0)
     return target_priors
 
-
 def tokenize_function(examples, block_size, tokenizer):
-    # NULL characters cause problems in HDF5 VLEN encoding
     texts = [text.replace("\x00", "").strip() for text in examples["text"]]
     encodings = tokenizer(
         texts,
@@ -329,25 +266,22 @@ def tokenize_function(examples, block_size, tokenizer):
         "input_ids": encodings["input_ids"],
         "offset_mapping": encodings["offset_mapping"],
     }
-
-    # group texts
-    # does not allow grouping across batches, but that's fine
     concatenated_examples = {k: list(chain(*output[k])) for k in output.keys()}
     total_length = len(concatenated_examples[list(output.keys())[0]])
-
     if total_length >= block_size:
         total_length = (total_length // block_size) * block_size
-
         result = {
             k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
             for k, t in concatenated_examples.items()
         }
         result["labels"] = result["input_ids"].copy()
-
     return result
 
+# ---------------------------
+# Update CHARS_TO_BYTES Mapping
+# ---------------------------
 
-# assumes byte pretokenization
+# Original fixed mapping.
 CHARS_TO_BYTES = {
     "Ā": 0,
     "ā": 1,
@@ -606,88 +540,73 @@ CHARS_TO_BYTES = {
     "þ": 254,
     "ÿ": 255,
 }
-BYTES_TO_CHARS = {v: k for k, v in CHARS_TO_BYTES.items()}
+# Extend CHARS_TO_BYTES to include Arabic characters (Unicode range: U+0600 to U+06FF)
+for code in range(0x0600, 0x06FF + 1):
+    ch = chr(code)
+    if ch not in CHARS_TO_BYTES:
+        CHARS_TO_BYTES[ch] = code
 
+BYTES_TO_CHARS = {v: k for k, v in CHARS_TO_BYTES.items()}
 
 def get_sample_indices(n, p, batch_size, min_k, n_samples):
     p = np.where(p > NEGATIVE_INF_FILL_VALUE, p, -np.inf)
     p = np.exp(p)
-
     indices = np.empty((n_samples, batch_size), dtype=np.int32)
-
     random_offset = 0
     random_indices = np.arange(n)
     np.random.shuffle(random_indices)
-
     n_samples_per_k = n_samples // min_k
     assert n_samples_per_k * min_k == n_samples
-
     for i in range(n_samples):
         if (i + 1) % n_samples_per_k == 0:
             num_random = len(random_indices) - random_offset
         else:
             num_random = len(random_indices) // n_samples_per_k
-
         indices[i, :num_random] = random_indices[
             random_offset : random_offset + num_random
         ]
-
         if (i + 1) % n_samples_per_k == 0:
             random_offset = 0
             np.random.shuffle(random_indices)
         else:
             random_offset += num_random
-
         sample_p = p.copy()
         sample_p[indices[i, :num_random]] = 0
         sample_p /= sample_p.sum()
         indices[i, num_random:] = np.random.choice(
             n, size=batch_size - num_random, p=sample_p, replace=False
         )
-
     return indices
-
 
 def get_surface_form_matrix(
     tokenizer_or_tokens, maxlen, tokenizer_to_use=None, padding=0, verbose=False
 ):
-    # tokens are expected to be byte encoded
     if isinstance(tokenizer_or_tokens, list):
         tokens = tokenizer_or_tokens
     else:
         tokenizer = tokenizer_or_tokens
         tokens = tokenizer.convert_ids_to_tokens(range(len(tokenizer)))
-
     vocab_size = len(tokens)
     surface_form_matrix = np.full(
         (vocab_size + padding, maxlen),
         tokenizer_to_use.pad_token_id if tokenizer_to_use is not None else 0,
         dtype=np.int32,
     )
-
     n_truncated = 0
-
     for i, token in tqdm(enumerate(tokens), total=vocab_size, disable=not verbose):
         if token in tokenizer_to_use.all_special_tokens:
             surface_form_matrix[i, 0] = tokenizer_to_use.convert_tokens_to_ids(token)
             continue
-
         token_bytes = bytes([CHARS_TO_BYTES[c] for c in token])
-
         if isinstance(tokenizer_to_use, ByT5Tokenizer):
             ids = tokenizer_to_use.convert_tokens_to_ids([chr(i) for i in token_bytes])
         else:
-            # assume hn tokenizer uses byte pretokenization
             ids = [x.id for x in tokenizer_to_use._tokenizer.model.tokenize(token)]
-
         if len(ids) > maxlen:
             ids = ids[:maxlen]
             n_truncated += 1
-
         surface_form_matrix[i, : len(ids)] = ids
-
     return surface_form_matrix, n_truncated
-
 
 def convert_ids_to_tokens(ids, surface_forms):
     tokens = []
@@ -695,28 +614,20 @@ def convert_ids_to_tokens(ids, surface_forms):
         s = "".join([BYTES_TO_CHARS[x] for x in surface_forms[i] if x != 0])
         if s == "<|endoftext|>":
             continue
-
         tokens.append(s)
-
     return tokens
-
 
 def get_subtree(tree, path):
     for p in path:
         tree = tree[p]
-
     return tree
-
 
 def needs_output_mapping(model_class):
     return model_class in {"FlaxAutoModelForMaskedLM", "FlaxAutoModelForCausalLM"}
 
-
-# from optax: https://github.com/google-deepmind/optax/blob/4eeef48f17cc2d9a5f9e4c5404ef9c766e44fbc9/optax/losses/_classification.py#L215
 def kl_divergence_with_log_targets(log_predictions, log_targets):
     loss = jnp.exp(log_targets) * (log_targets - log_predictions)
     return jnp.sum(loss, axis=-1)
-
 
 def load_params(model_name_or_path, **kwargs):
     try:
@@ -725,7 +636,6 @@ def load_params(model_name_or_path, **kwargs):
         )
     except OSError:
         index = None
-
     if index is not None:
         index = json.load(open(index))
         files = [
@@ -734,13 +644,10 @@ def load_params(model_name_or_path, **kwargs):
         ]
     else:
         files = [cached_file(model_name_or_path, "flax_model.msgpack", **kwargs)]
-
     params = {}
     for x in files:
         params.update(traverse_util.flatten_dict(msgpack_restore(open(x, "rb").read())))
-
     return traverse_util.unflatten_dict(params)
-
 
 def keystr(x):
     if hasattr(x, "name"):
@@ -749,10 +656,8 @@ def keystr(x):
         return x.key
     elif hasattr(x, "idx"):
         return x.idx
-
     assert isinstance(x, str)
     return x
-
 
 keys_to_model_shard = {
     "target_surface_forms",
@@ -763,36 +668,26 @@ keys_to_model_shard = {
     "attention_mask",
 }
 
-
 def get_batch_pspecs(batch):
     pspecs = {}
     keys_to_ignore = {"lang_code", "metrics"}
-
     for key in batch.keys():
         if key in keys_to_ignore:
             continue
-
         pspec = [None] * (batch[key].ndim)
-
         if key in keys_to_model_shard:
             pspec[0] = "model"
-
         pspecs[key] = P(*pspec)
-
     return pspecs
-
 
 def to_global_batch(batch, shardings):
     if shardings is not None:
         for key in keys_to_model_shard:
             if key not in batch:
                 continue
-
             data = batch.pop(key)
-
             def cb(index):
                 return data[index]
-
             batch[key] = jax.make_array_from_callback(data.shape, shardings[key], cb)
-
     return batch
+
